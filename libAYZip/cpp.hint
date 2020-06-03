@@ -1,0 +1,2 @@
+#define LIBAYZIP_API __declspec(dllexport)
+#define LIBAYZIP_API __declspec(dllimport)
