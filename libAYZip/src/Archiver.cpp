@@ -64,6 +64,11 @@ static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64
         return false;
     }
 
+    fs::path parentDirectory = file_path.parent_path();
+    if (!fs::exists(parentDirectory)) {
+        fs::create_directories(parentDirectory);
+    }
+
     std::ofstream ofs(file_path.string(), std::ifstream::binary);
     if (ofs.bad()) {
         unzCloseCurrentFile(zip_file);
@@ -182,10 +187,7 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
 
         fs::path absolute_path = appBundlePath / toWin32Path(filename);
         if (endsWith(filename, "/")) { // directory
-            if (fs::create_directories(absolute_path)) {
-                aylog_log("Extracted directory faild: %s", filename.c_str());
-                break;
-            }
+            fs::create_directories(absolute_path); // must create_directories inculde parent path 
         }
         else { // file
             if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
