@@ -13,5 +13,5 @@
 #endif
 
 
-LIBAYZIP_API int AYUnzipApp(const char *archivePath, const char *outputDirectory);
-LIBAYZIP_API int AYZipApp(const char *filePath, const char *archivePath);
+LIBAYZIP_API bool AYUnzipApp(const char *archivePath, const char *appPath);
+LIBAYZIP_API bool AYZipApp(const char *appPath, const char *archivePath);

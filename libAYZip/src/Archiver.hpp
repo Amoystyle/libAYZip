@@ -11,7 +11,7 @@
 
 #include <string>
 
-std::string UnzipAppBundle(const std::string archivePath, const std::string outputDirectory);
-std::string ZipAppBundle(const std::string filePath, const std::string archivePath);
+bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDirectory);
+bool ZipAppBundle(const std::string &appPath, const std::string &archivePath);
 
 #endif /* Archiver_hpp */

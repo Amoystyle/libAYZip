@@ -7,54 +7,25 @@
 //
 
 #include "Archiver.hpp"
+#include <AYLog.h>
 #include <chrono>
 #include <iomanip>
 #include <filesystem>
 #include <fstream>
-#include "Error.hpp"
-#include "CommonFunc.h"
+
+#include <sstream>
+#include <WinSock2.h>
+
+namespace fs = std::filesystem;
 
 extern "C" {
 #include "minizip/zip.h"
 #include "minizip/unzip.h"
 }
 
-#ifdef _WIN32
-#include <io.h>
-#define access    _access_s
-#else
-#include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
-#endif
+const int kZipBufSize = 8192;
+const int kZipMaxPath = 512;
 
-const int ALTReadBufferSize = 8192;
-const int ALTMaxFilenameLength = 512;
-
-#include <sstream>
-#include <WinSock2.h>
-
-#define odslog(msg) { std::wstringstream ss; ss << msg << std::endl; OutputDebugStringW(ss.str().c_str()); }
-
-#ifdef _WIN32
-char ALTDirectoryDeliminator = '\\';
-#else
-char ALTDirectoryDeliminator = '/';
-#endif
-
-#define READ_BUFFER_SIZE 8192
-#define MAX_FILENAME 512
-
-namespace fs = std::filesystem;
-
-
-static bool isASCII(const std::string &str)
-{
-    for (char C : str)
-        if (static_cast<unsigned char>(C) >= 0x80)
-            return false;
-    return true;
-}
 
 static bool endsWith(const std::string &str, const std::string &suffix)
 {
@@ -66,285 +37,291 @@ static bool startsWith(const std::string &str, const std::string &prefix)
     return str.size() >= prefix.size() && 0 == str.compare(0, prefix.size(), prefix);
 }
 
-extern std::string replace_all(
-    const std::string &str,   // where to work
-    const std::string &find,  // substitute 'find'
-    const std::string &replace //      by 'replace'
-);
-
-std::string UnzipAppBundle(const std::string filePath, std::string outputDirectory)
+static std::string replace_all(const std::string &str,
+                               const std::string &find,
+                               const std::string &replace)
 {
-    if (outputDirectory[outputDirectory.size() - 1] != ALTDirectoryDeliminator) {
-        outputDirectory += ALTDirectoryDeliminator;
+    std::string result;
+    size_t find_len = find.size();
+    size_t pos, from = 0;
+    while (std::string::npos != (pos = str.find(find, from))) {
+        result.append(str, from, pos - from);
+        result.append(replace);
+        from = pos + find_len;
+    }
+    result.append(str, from, std::string::npos);
+    return result;
+}
+
+/********************************************
+ *                                          *
+ *            UnzipAppBundle                *
+ *                                          *
+ ********************************************/
+static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64_t num_bytes_to_extract)
+{
+    if (unzOpenCurrentFile(zip_file) != UNZ_OK) {
+        return false;
     }
 
-    unzFile zipFile = unzOpen(filePath.c_str());
-    if (zipFile == NULL) {
-        throw ArchiveError(ArchiveErrorCode::NoSuchFile);
+    std::ofstream ofs(file_path.string(), std::ifstream::binary);
+    if (ofs.bad()) {
+        unzCloseCurrentFile(zip_file);
+        return false;
     }
 
-    FILE *outputFile = nullptr;
+    std::unique_ptr<char[]> buf(new char[kZipBufSize]);
 
-    auto finish = [&outputFile, &zipFile](void) {
-        if (outputFile != nullptr) {
-            fclose(outputFile);
+    uint64_t remaining_capacity = num_bytes_to_extract;
+    bool entire_file_extracted = false;
+
+    while (remaining_capacity > 0) {
+        const int num_bytes_read = unzReadCurrentFile(zip_file, buf.get(), kZipBufSize);
+
+        if (num_bytes_read == 0) {
+            entire_file_extracted = true;
+            break;
         }
+        else if (num_bytes_read < 0) {
+            // If num_bytes_read < 0, then it's a specific UNZ_* error code.
+            break;
+        }
+        else if (num_bytes_read > 0) {
+            uint64_t num_bytes_to_write = std::min<uint64_t>(remaining_capacity, static_cast<uint64_t>(num_bytes_read));
 
-        unzCloseCurrentFile(zipFile);
-        unzClose(zipFile);
+            ofs.write(buf.get(), num_bytes_to_write);
+            if (ofs.bad()) {
+                break;
+            }
+
+            if (remaining_capacity == static_cast<uint64_t>(num_bytes_read)) {
+                // Ensures function returns true if the entire file has been read.
+                entire_file_extracted = (unzReadCurrentFile(zip_file, buf.get(), 1) == 0);
+            }
+
+            remaining_capacity -= num_bytes_to_write;
+        }
+    }
+
+    unzCloseCurrentFile(zip_file);
+
+    return entire_file_extracted;
+}
+
+static bool AdvanceToNextEntry(zipFile zip_file, uLong num_entries)
+{
+    if (num_entries == 0)
+        return false;
+
+    unz_file_pos position = {};
+    if (unzGetFilePos(zip_file, &position) != UNZ_OK)
+        return false;
+
+    const uLong current_entry_index = position.num_of_file;
+    // If we are currently at the last entry, then the next position is the
+    // end of the zip file, so mark that we reached the end.
+    if (current_entry_index + 1 == num_entries) {
+        return false;
+    }
+    else {
+        if (unzGoToNextFile(zip_file) != UNZ_OK) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDirectory)
+{
+    fs::path appBundlePath = outputDirectory;
+    fs::path ipaPath = archivePath;
+
+    if (!fs::exists(appBundlePath)) {
+        return false;
+    }
+
+    unzFile zip_file = unzOpen(archivePath.c_str());
+    if (zip_file == NULL) {
+        aylog_log("unzOpen faild: %s", archivePath.c_str());
+        return false;
+    }
+
+    unz_global_info zip_info = {};
+    if (unzGetGlobalInfo(zip_file, &zip_info) != UNZ_OK) {
+        unzClose(zip_file);
+        return false;
+    }
+
+    auto toWin32Path = [](std::string filename) -> std::string {
+        std::replace(filename.begin(), filename.end(), '/', '\\');
+        std::string outname = replace_all(filename, ":", "__colon__");
+        return fs::relative(outname, "Payload\\").string();
     };
 
-    unz_global_info zipInfo;
-    if (unzGetGlobalInfo(zipFile, &zipInfo) != UNZ_OK) {
-        finish();
-        throw ArchiveError(ArchiveErrorCode::CorruptFile);
-    }
+    uLong reached_end = 0;
+    for (; AdvanceToNextEntry(zip_file, zip_info.number_entry); reached_end++) {
+        unz_file_info raw_file_info = {};
+        char raw_file_name_in_zip[kZipMaxPath] = {};
 
-    fs::path payloadDirectoryPath = fs::path(outputDirectory).append("Payload");
-    if (!fs::exists(payloadDirectoryPath)) {
-        fs::create_directory(payloadDirectoryPath);
-    }
-
-    char buffer[ALTReadBufferSize];
-
-    for (uLong i = 0; i < zipInfo.number_entry; i++) {
-        unz_file_info info;
-        char cFilename[ALTMaxFilenameLength];
-
-        if (unzGetCurrentFileInfo(zipFile, &info, cFilename, ALTMaxFilenameLength, NULL, 0, NULL, 0) != UNZ_OK) {
-            finish();
-            throw ArchiveError(ArchiveErrorCode::Unknown);
+        if (unzGetCurrentFileInfo(zip_file, &raw_file_info, raw_file_name_in_zip, kZipMaxPath, NULL, 0, NULL, 0) != UNZ_OK) {
+            break;
         }
 
         std::string filename;
-        if (info.flag & 0x808) { // 0x800 | 0x8
-            filename = fs::u8path(cFilename).string();
+        if (raw_file_info.flag & 0x808) { // 0x800 | 0x8
+            filename = fs::u8path(raw_file_name_in_zip).string();
         }
         else {
-            filename = fs::path(cFilename).string();;
+            filename = fs::path(raw_file_name_in_zip).string();
         }
 
         if (startsWith(filename, "__MACOSX")) {
-            if (i + 1 < zipInfo.number_entry) {
-                if (unzGoToNextFile(zipFile) != UNZ_OK) {
-                    finish();
-                    throw ArchiveError(ArchiveErrorCode::Unknown);
-                }
-            }
-
             continue;
         }
 
-        std::replace(filename.begin(), filename.end(), '/', ALTDirectoryDeliminator);
-        filename = replace_all(filename, ":", "__colon__");
-
-        fs::path filepath = fs::path(outputDirectory).append(filename);
-        fs::path parentDirectory = (filename[filename.size() - 1] == ALTDirectoryDeliminator) ? filepath.parent_path().parent_path() : filepath.parent_path();
-
-        if (!fs::exists(parentDirectory)) {
-            fs::create_directory(parentDirectory);
-        }
-
-        if (filename[filename.size() - 1] == ALTDirectoryDeliminator) {
-            // Directory
-            fs::create_directory(filepath);
-        }
-        else {
-            // File
-            if (unzOpenCurrentFile(zipFile) != UNZ_OK) {
-                finish();
-                throw ArchiveError(ArchiveErrorCode::Unknown);
+        fs::path absolute_path = appBundlePath / toWin32Path(filename);
+        if (endsWith(filename, "/")) { // directory
+            if (fs::create_directories(absolute_path)) {
+                aylog_log("Extracted directory faild: %s", filename.c_str());
+                break;
             }
-
-            std::string narrowFilepath = filepath.string();
-
-            outputFile = fopen(narrowFilepath.c_str(), "wb");
-            if (outputFile == NULL) {
-                finish();
-                throw ArchiveError(ArchiveErrorCode::UnknownWrite);
-            }
-
-            int result = UNZ_OK;
-
-            do {
-                result = unzReadCurrentFile(zipFile, buffer, ALTReadBufferSize);
-
-                if (result < 0) {
-                    finish();
-                    throw ArchiveError(ArchiveErrorCode::Unknown);
-                }
-
-                size_t count = fwrite(buffer, result, 1, outputFile);
-                if (result > 0 && count != 1) {
-                    finish();
-                    throw ArchiveError(ArchiveErrorCode::UnknownWrite);
-                }
-
-            } while (result > 0);
-
-            odslog("Extracted file:" << filepath);
-
-            short permissions = (info.external_fa >> 16) & 0x01FF;
-            _chmod(narrowFilepath.c_str(), permissions);
-
-            fclose(outputFile);
-            outputFile = NULL;
         }
-
-        unzCloseCurrentFile(zipFile);
-
-        if (i + 1 < zipInfo.number_entry) {
-            if (unzGoToNextFile(zipFile) != UNZ_OK) {
-                finish();
-                throw ArchiveError(ArchiveErrorCode::Unknown);
+        else { // file
+            if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
+                aylog_log("Extracted file faild: %s", filename.c_str());
+                break;
             }
         }
     }
 
-    for (auto &p : fs::directory_iterator(payloadDirectoryPath)) {
-        auto filename = p.path().filename().string();
+    unzClose(zip_file);
 
-        auto lowercaseFilename = filename;
-        std::transform(lowercaseFilename.begin(), lowercaseFilename.end(), lowercaseFilename.begin(), [](unsigned char c) {
-            return std::tolower(c);
-        });
-
-        if (!endsWith(lowercaseFilename, ".app")) {
-            continue;
-        }
-
-        auto appBundlePath = payloadDirectoryPath;
-        appBundlePath.append(filename);
-
-        auto outputPath = outputDirectory;
-        outputPath.append(filename);
-
-        if (fs::exists(outputPath)) {
-            fs::remove(outputPath);
-        }
-
-        fs::rename(appBundlePath, outputPath);
-
-        finish();
-
-        fs::remove(payloadDirectoryPath);
-
-        return outputPath;
-    }
-
-    throw SignError(SignError(SignErrorCode::MissingAppBundle));
+    return reached_end + 1 == zip_info.number_entry;
 }
 
-void WriteFileToZipFile(zipFile zipFile, fs::path filepath, fs::path relativePath)
+
+/********************************************
+ *                                          *
+ *              ZipAppBundle                *
+ *                                          *
+ ********************************************/
+ // Returns a zip_fileinfo struct with the time represented by |file_time|.
+static zip_fileinfo TimeToZipFileInfo(const fs::path &file_path)
 {
-    bool isDirectory = fs::is_directory(filepath);
+    zip_fileinfo zip_info = {};
 
-    std::string filename = relativePath.string();
+    using namespace std::chrono_literals;
+    auto ftime = fs::last_write_time(file_path);
+    auto tmp = fs::file_time_type::clock::now().time_since_epoch() - ftime.time_since_epoch();
+    auto sys = std::chrono::system_clock::now() - tmp;
+    std::time_t t = std::chrono::system_clock::to_time_t(sys);
+    tm lt = {};
+    localtime_s(&lt, &t);
 
-    zip_fileinfo fileInfo = {};
+    //time_t CurTime = time(NULL);
+    //tm *mytime = localtime(&CurTime);
+    zip_info.tmz_date.tm_sec = lt.tm_sec;
+    zip_info.tmz_date.tm_min = lt.tm_min;
+    zip_info.tmz_date.tm_hour = lt.tm_hour;
+    zip_info.tmz_date.tm_mday = lt.tm_mday;
+    zip_info.tmz_date.tm_mon = lt.tm_mon;
+    zip_info.tmz_date.tm_year = lt.tm_year;
 
-    char *bytes = nullptr;
-    unsigned int fileSize = 0;
-    std::vector<char> data;
-
-    if (isDirectory) {
-        // Remove leading directory slash.
-        if (filename[0] == ALTDirectoryDeliminator) {
-            filename = std::string(filename.begin() + 1, filename.end());
-        }
-
-        // Add trailing directory slash.
-        if (filename[filename.size() - 1] != ALTDirectoryDeliminator) {
-            filename = filename + ALTDirectoryDeliminator;
-        }
-    }
-    else {
-        // permissions
-        fs::file_status status = fs::status(filepath);
-
-        short permissions = (short)status.permissions();
-        long shiftedPermissions = 0100000 + permissions;
-
-        uLong permissionsLong = (uLong)shiftedPermissions;
-
-        fileInfo.external_fa = (unsigned int)(permissionsLong << 16L);
-
-        // time
-        using namespace std::chrono_literals;
-        auto ftime = fs::last_write_time(filepath);
-        auto tmp = fs::_File_time_clock::now().time_since_epoch() - ftime.time_since_epoch();
-        auto sys = std::chrono::system_clock::now() - tmp;
-        std::time_t t = std::chrono::system_clock::to_time_t(sys);
-        const std::tm *lt = std::localtime(&t);
-
-        //time_t CurTime = time(NULL);
-        //tm *mytime = localtime(&CurTime);
-        fileInfo.tmz_date.tm_sec = lt->tm_sec;
-        fileInfo.tmz_date.tm_min = lt->tm_min;
-        fileInfo.tmz_date.tm_hour = lt->tm_hour;
-        fileInfo.tmz_date.tm_mday = lt->tm_mday;
-        fileInfo.tmz_date.tm_mon = lt->tm_mon;
-        fileInfo.tmz_date.tm_year = lt->tm_year;
-
-        std::ifstream ifs(filepath.string(), std::ifstream::in | std::ifstream::binary);
-        data.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    }
-
-    std::replace(filename.begin(), filename.end(), ALTDirectoryDeliminator, '/');
-    filename = replace_all(filename, "__colon__", ":");
-
-    if (isASCII(filename)) {
-        if (zipOpenNewFileInZip(zipFile,
-                                filename.c_str(),
-                                &fileInfo,
-                                NULL,
-                                0,
-                                NULL,
-                                0,
-                                NULL,
-                                Z_DEFLATED,
-                                Z_DEFAULT_COMPRESSION) != ZIP_OK) {
-            throw ArchiveError(ArchiveErrorCode::UnknownWrite);
-        }
-    }
-    else {
-        filename = fs::path(filename).u8string();
-        // Setting the Language encoding flag so the file is told to be in utf-8.
-        const uLong LANGUAGE_ENCODING_FLAG = 0x1 << 11;
-        if (ZIP_OK != zipOpenNewFileInZip4(zipFile,             // file
-                                           filename.c_str(),    // filename
-                                           &fileInfo,           // zipfi
-                                           NULL,                // extrafield_local,
-                                           0,                   // size_extrafield_local
-                                           NULL,                // extrafield_global
-                                           0,                   // size_extrafield_global
-                                           NULL,                // comment
-                                           Z_DEFLATED,          // method
-                                           Z_DEFAULT_COMPRESSION,  // level0
-                                           0,                   // raw
-                                           -MAX_WBITS,          // windowBits
-                                           DEF_MEM_LEVEL,       // memLevel
-                                           Z_DEFAULT_STRATEGY,  // strategy
-                                           NULL,                // password
-                                           0,                   // crcForCrypting
-                                           0,                   // versionMadeBy
-                                           LANGUAGE_ENCODING_FLAG)) {
-            throw ArchiveError(ArchiveErrorCode::UnknownWrite);
-        }
-    }
-
-
-    if (!data.empty()) {
-        if (zipWriteInFileInZip(zipFile, data.data(), data.size()) != ZIP_OK) {
-            zipCloseFileInZip(zipFile);
-            throw ArchiveError(ArchiveErrorCode::UnknownWrite);
-        }
-    }
+    return zip_info;
 }
 
-std::string ZipAppBundle(const std::string filePath, const std::string archivePath)
+static bool OpenNewFileEntry(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path, bool is_directory)
 {
-    fs::path appBundlePath = filePath;
+    std::string str_path = relative_path.u8string();
+
+    auto toZipPath = [](std::string filename) -> std::string {
+        std::replace(filename.begin(), filename.end(), '\\', '/');
+        return replace_all(filename, "__colon__", ":");
+    };
+
+    std::string filename = toZipPath(str_path);
+
+    if (is_directory)
+        filename += "/";
+
+    // Section 4.4.4 http://www.pkware.com/documents/casestudies/APPNOTE.TXT
+    // Setting the Language encoding flag so the file is told to be in utf-8.
+    const uLong LANGUAGE_ENCODING_FLAG = 0x1 << 11;
+
+    zip_fileinfo file_info = TimeToZipFileInfo(absolute_path);
+    if (ZIP_OK != zipOpenNewFileInZip4(zip_file,                // file
+                                       filename.c_str(),        // filename
+                                       &file_info,              // zip_fileinfo
+                                       NULL,                    // extrafield_local,
+                                       0u,                      // size_extrafield_local
+                                       NULL,                    // extrafield_global
+                                       0u,                      // size_extrafield_global
+                                       NULL,                    // comment
+                                       Z_DEFLATED,              // method
+                                       Z_DEFAULT_COMPRESSION,   // level
+                                       0,                       // raw
+                                       -MAX_WBITS,              // windowBits
+                                       DEF_MEM_LEVEL,           // memLevel
+                                       Z_DEFAULT_STRATEGY,      // strategy
+                                       NULL,                    // password
+                                       0,                       // crcForCrypting
+                                       0,                       // versionMadeBy
+                                       LANGUAGE_ENCODING_FLAG)) {  // flagBase
+        return false;
+    }
+    return true;
+}
+
+static bool CloseNewFileEntry(zipFile zip_file)
+{
+    return zipCloseFileInZip(zip_file) == ZIP_OK;
+}
+
+static bool AddFileContentToZip(zipFile zip_file, const fs::path &file_path)
+{
+    int num_bytes;
+    char buf[kZipBufSize];
+
+    std::ifstream ifs(file_path.string(), std::ifstream::binary);
+    do {
+        ifs.read(buf, kZipBufSize);
+        num_bytes = static_cast<int>(ifs.gcount());
+
+        if (num_bytes > 0) {
+            if (zipWriteInFileInZip(zip_file, buf, num_bytes) != ZIP_OK) {
+                //DLOG(ERROR) << "Could not write data to zip for path " << file_path.value();
+                return false;
+            }
+        }
+    } while (ifs);
+
+    return true;
+}
+
+static bool AddFileEntryToZip(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path)
+{
+    if (!fs::exists(absolute_path))
+        return false;
+
+    if (!OpenNewFileEntry(zip_file, relative_path, absolute_path, false))
+        return false;
+
+    bool success = AddFileContentToZip(zip_file, absolute_path);
+    if (!CloseNewFileEntry(zip_file))
+        return false;
+
+    return success;
+}
+
+static bool AddDirectoryEntryToZip(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path)
+{
+    return OpenNewFileEntry(zip_file, relative_path, absolute_path, true) && CloseNewFileEntry(zip_file);
+}
+
+bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
+{
+    fs::path appBundlePath = appPath;
     fs::path ipaPath = archivePath;
 
     auto appBundleFilename = appBundlePath.filename();
@@ -361,21 +338,30 @@ std::string ZipAppBundle(const std::string filePath, const std::string archivePa
 
     zipFile zipFile = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
     if (zipFile == nullptr) {
-        throw ArchiveError(ArchiveErrorCode::UnknownWrite);
+        aylog_log("zipOpen faild: %s", archivePath.c_str());
+        return false;
     }
 
-    fs::path payloadDirectory = "Payload";
-    fs::path appBundleDirectory = payloadDirectory / appBundleFilename;
+    fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
 
-    fs::path rootPath = filePath;
-    for (auto &entry : fs::recursive_directory_iterator(rootPath)) {
-        auto filepath = entry.path();
-        auto relativePath = appBundleDirectory / fs::relative(filepath, rootPath);
+    for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
+        auto absolute_path = entry.path();
+        auto relativePath = appBundleDirectory / fs::relative(absolute_path, appBundlePath);
 
-        //odslog(relativePath);
-        WriteFileToZipFile(zipFile, filepath, relativePath);
+        if (entry.is_directory()) {
+            if (!AddDirectoryEntryToZip(zipFile, relativePath, absolute_path)) {
+                zipClose(zipFile, NULL);
+                return false;
+            }
+        }
+        else {
+            if (!AddFileEntryToZip(zipFile, relativePath, absolute_path)) {
+                zipClose(zipFile, NULL);
+                return false;
+            }
+        }
     }
 
     zipClose(zipFile, NULL);
-    return ipaPath.string();
+    return true;
 }

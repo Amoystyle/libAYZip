@@ -23,7 +23,7 @@
       <UniqueIdentifier>{b23d3b74-0720-4f0d-88ea-444bec0d15df}</UniqueIdentifier>
     </Filter>
     <Filter Include="Utilities">
-      <UniqueIdentifier>{dd7367df-dc9f-4771-a95e-3c2ad221f7a1}</UniqueIdentifier>
+      <UniqueIdentifier>{953a5665-3a72-4efa-b085-f6d19be4f771}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -42,9 +42,6 @@
     <ClInclude Include="src\minizip\ioapi.h">
       <Filter>src\minizip</Filter>
     </ClInclude>
-    <ClInclude Include="src\minizip\mztools.h">
-      <Filter>src\minizip</Filter>
-    </ClInclude>
     <ClInclude Include="src\minizip\unzip.h">
       <Filter>src\minizip</Filter>
     </ClInclude>
@@ -54,20 +51,14 @@
     <ClInclude Include="src\Archiver.hpp">
       <Filter>src</Filter>
     </ClInclude>
-    <ClInclude Include="src\Error.hpp">
-      <Filter>src</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ServerError.hpp">
-      <Filter>src</Filter>
-    </ClInclude>
     <ClInclude Include="libAYZip.h">
       <Filter>dll</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\AYBase\CommonFunc.h">
-      <Filter>Utilities</Filter>
-    </ClInclude>
     <ClInclude Include="resource.h">
       <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\AYBase\AYLog.h">
+      <Filter>Utilities</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -78,9 +69,6 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\minizip\ioapi.c">
-      <Filter>src\minizip</Filter>
-    </ClCompile>
-    <ClCompile Include="src\minizip\mztools.c">
       <Filter>src\minizip</Filter>
     </ClCompile>
     <ClCompile Include="src\minizip\unzip.c">
@@ -95,7 +83,7 @@
     <ClCompile Include="libAYZip.cpp">
       <Filter>dll</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\AYBase\CommonFunc.cpp">
+    <ClCompile Include="..\..\AYBase\AYLog.cpp">
       <Filter>Utilities</Filter>
     </ClCompile>
   </ItemGroup>

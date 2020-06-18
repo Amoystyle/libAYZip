@@ -9,42 +9,21 @@
 
 #include <sstream>
 
-int AYUnzipApp(const char *archivePath, const char *outputDirectory)
+bool AYUnzipApp(const char *archivePath, const char *appPath)
 {
-    int ret = 0;
-    std::stringstream ss;
-
-    try {
-        UnzipAppBundle(archivePath, outputDirectory);
-    }
-    catch (Error &error) {
-        ss << error;
-        ret = -1;
-    }
-    catch (std::exception &exception) {
-        ss << "Exception: " << exception.what();
-        ret = -1;
+    if (archivePath == nullptr) {
+        return false;
     }
 
-    return ret;
+    return UnzipAppBundle(archivePath, appPath ? appPath : "");;
 }
 
-int AYZipApp(const char *filePath, const char *archivePath)
+bool AYZipApp(const char *appPath, const char *archivePath)
 {
-    int ret = 0;
-    std::stringstream ss;
 
-    try {
-        ZipAppBundle(filePath, archivePath ? archivePath : "");
-    }
-    catch (Error &error) {
-        ss << error;
-        ret = -1;
-    }
-    catch (std::exception &exception) {
-        ss << "Exception: " << exception.what();
-        ret = -1;
+    if (appPath == nullptr) {
+        return false;
     }
 
-    return ret;
+    return ZipAppBundle(appPath, archivePath ? archivePath : "");;
 }
