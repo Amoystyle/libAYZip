@@ -115,9 +115,6 @@ static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64
 
 static bool AdvanceToNextEntry(zipFile zip_file, uLong num_entries)
 {
-    if (num_entries == 0)
-        return false;
-
     unz_file_pos position = {};
     if (unzGetFilePos(zip_file, &position) != UNZ_OK)
         return false;
@@ -164,8 +161,8 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
         return fs::relative(outname, "Payload\\").string();
     };
 
-    uLong reached_end = 0;
-    for (; AdvanceToNextEntry(zip_file, zip_info.number_entry); reached_end++) {
+
+    do {
         unz_file_info raw_file_info = {};
         char raw_file_name_in_zip[kZipMaxPath] = {};
 
@@ -192,14 +189,15 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
         else { // file
             if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
                 aylog_log("Extracted file faild: %s", filename.c_str());
-                break;
+                unzClose(zip_file);
+                return false;
             }
         }
-    }
+    } while (AdvanceToNextEntry(zip_file, zip_info.number_entry));
 
     unzClose(zip_file);
 
-    return reached_end + 1 == zip_info.number_entry;
+    return true;
 }
 
 
@@ -212,15 +210,22 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
 static zip_fileinfo TimeToZipFileInfo(const fs::path &file_path)
 {
     zip_fileinfo zip_info = {};
-
-    using namespace std::chrono_literals;
-    auto ftime = fs::last_write_time(file_path);
-    auto tmp = fs::file_time_type::clock::now().time_since_epoch() - ftime.time_since_epoch();
-    auto sys = std::chrono::system_clock::now() - tmp;
-    std::time_t t = std::chrono::system_clock::to_time_t(sys);
     tm lt = {};
-    localtime_s(&lt, &t);
+    std::time_t t = 0;
 
+    if (fs::exists(file_path)) {
+        using namespace std::chrono_literals;
+        auto ftime = fs::last_write_time(file_path);
+        auto tmp = fs::file_time_type::clock::now().time_since_epoch() - ftime.time_since_epoch();
+        auto sys = std::chrono::system_clock::now() - tmp;
+        t = std::chrono::system_clock::to_time_t(sys);
+    }
+    else {
+        auto sys = std::chrono::system_clock::now();
+        t = std::chrono::system_clock::to_time_t(sys);
+    }
+
+    localtime_s(&lt, &t);
     //time_t CurTime = time(NULL);
     //tm *mytime = localtime(&CurTime);
     zip_info.tmz_date.tm_sec = lt.tm_sec;
@@ -292,7 +297,7 @@ static bool AddFileContentToZip(zipFile zip_file, const fs::path &file_path)
 
         if (num_bytes > 0) {
             if (zipWriteInFileInZip(zip_file, buf, num_bytes) != ZIP_OK) {
-                //DLOG(ERROR) << "Could not write data to zip for path " << file_path.value();
+                aylog_log("Add file to zip: %s", file_path.c_str());
                 return false;
             }
         }
@@ -338,32 +343,35 @@ bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
         fs::remove(ipaPath);
     }
 
-    zipFile zipFile = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
-    if (zipFile == nullptr) {
+    zipFile zip_file = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
+    if (zip_file == nullptr) {
         aylog_log("zipOpen faild: %s", archivePath.c_str());
         return false;
     }
 
     fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
 
+    // must add
+    //AddDirectoryEntryToZip(zip_file, "Payload", "");
+
     for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
         auto absolute_path = entry.path();
         auto relativePath = appBundleDirectory / fs::relative(absolute_path, appBundlePath);
 
         if (entry.is_directory()) {
-            if (!AddDirectoryEntryToZip(zipFile, relativePath, absolute_path)) {
-                zipClose(zipFile, NULL);
+            if (!AddDirectoryEntryToZip(zip_file, relativePath, absolute_path)) {
+                zipClose(zip_file, NULL);
                 return false;
             }
         }
         else {
-            if (!AddFileEntryToZip(zipFile, relativePath, absolute_path)) {
-                zipClose(zipFile, NULL);
+            if (!AddFileEntryToZip(zip_file, relativePath, absolute_path)) {
+                zipClose(zip_file, NULL);
                 return false;
             }
         }
     }
 
-    zipClose(zipFile, NULL);
+    zipClose(zip_file, NULL);
     return true;
 }
