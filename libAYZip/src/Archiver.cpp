@@ -143,61 +143,68 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
         return false;
     }
 
-    unzFile zip_file = unzOpen(archivePath.c_str());
-    if (zip_file == NULL) {
-        aylog_log("unzOpen faild: %s", archivePath.c_str());
-        return false;
-    }
-
-    unz_global_info zip_info = {};
-    if (unzGetGlobalInfo(zip_file, &zip_info) != UNZ_OK) {
-        unzClose(zip_file);
-        return false;
-    }
-
-    auto toWin32Path = [](std::string filename) -> std::string {
-        std::replace(filename.begin(), filename.end(), '/', '\\');
-        std::string outname = replace_all(filename, ":", "__colon__");
-        return fs::relative(outname, "Payload\\").string();
-    };
-
-
-    do {
-        unz_file_info raw_file_info = {};
-        char raw_file_name_in_zip[kZipMaxPath] = {};
-
-        if (unzGetCurrentFileInfo(zip_file, &raw_file_info, raw_file_name_in_zip, kZipMaxPath, NULL, 0, NULL, 0) != UNZ_OK) {
-            break;
+    try {
+        unzFile zip_file = unzOpen(archivePath.c_str());
+        if (zip_file == NULL) {
+            aylog_log("unzOpen faild: %s", archivePath.c_str());
+            return false;
         }
 
-        std::string filename;
-        if (raw_file_info.flag & 0x808) { // 0x800 | 0x8
-            filename = fs::u8path(raw_file_name_in_zip).string();
-        }
-        else {
-            filename = fs::path(raw_file_name_in_zip).string();
+        unz_global_info zip_info = {};
+        if (unzGetGlobalInfo(zip_file, &zip_info) != UNZ_OK) {
+            unzClose(zip_file);
+            return false;
         }
 
-        if (startsWith(filename, "__MACOSX")) {
-            continue;
-        }
+        auto toWin32Path = [](std::string filename) -> std::string {
+            std::replace(filename.begin(), filename.end(), '/', '\\');
+            std::string outname = replace_all(filename, ":", "__colon__");
+            return fs::relative(outname, "Payload\\").string();
+        };
 
-        fs::path absolute_path = appBundlePath / toWin32Path(filename);
-        if (endsWith(filename, "/")) { // directory
-            fs::create_directories(absolute_path); // must create_directories inculde parent path 
-        }
-        else { // file
-            if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
-                aylog_log("Extracted file faild: %s", filename.c_str());
-                unzClose(zip_file);
-                return false;
+
+        do {
+            unz_file_info raw_file_info = {};
+            char raw_file_name_in_zip[kZipMaxPath] = {};
+
+            if (unzGetCurrentFileInfo(zip_file, &raw_file_info, raw_file_name_in_zip, kZipMaxPath, NULL, 0, NULL, 0) != UNZ_OK) {
+                break;
             }
-        }
-    } while (AdvanceToNextEntry(zip_file, zip_info.number_entry));
 
-    unzClose(zip_file);
+            std::string filename;
+            if (raw_file_info.flag & 0x808) { // 0x800 | 0x8
+                filename = fs::u8path(raw_file_name_in_zip).string();
+            }
+            else {
+                filename = fs::path(raw_file_name_in_zip).string();
+            }
 
-    return true;
+            if (startsWith(filename, "__MACOSX")) {
+                continue;
+            }
+
+            fs::path absolute_path = appBundlePath / toWin32Path(filename);
+            if (endsWith(filename, "/")) { // directory
+                fs::create_directories(absolute_path); // must create_directories inculde parent path 
+            }
+            else { // file
+                if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
+                    aylog_log("Extracted file faild: %s", filename.c_str());
+                    unzClose(zip_file);
+                    return false;
+                }
+            }
+        } while (AdvanceToNextEntry(zip_file, zip_info.number_entry));
+
+        unzClose(zip_file);
+
+        return true;
+    }
+    catch (const std::exception &e) {
+        aylog_log("%s", e.what());
+    }
+
+    return false;
 }
 
 
@@ -339,39 +346,47 @@ bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
         ipaPath = appBundlePath.remove_filename().append(ipaName);
     }
 
-    if (fs::exists(ipaPath)) {
-        fs::remove(ipaPath);
-    }
+    try {
+        if (fs::exists(ipaPath)) {
+            fs::remove(ipaPath);
+        }
 
-    zipFile zip_file = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
-    if (zip_file == nullptr) {
-        aylog_log("zipOpen faild: %s", archivePath.c_str());
-        return false;
-    }
+        zipFile zip_file = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
+        if (zip_file == nullptr) {
+            aylog_log("zipOpen faild: %s", archivePath.c_str());
+            return false;
+        }
 
-    fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
+        fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
 
-    // must add
-    //AddDirectoryEntryToZip(zip_file, "Payload", "");
+        // must add
+        //AddDirectoryEntryToZip(zip_file, "Payload", "");
 
-    for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
-        auto absolute_path = entry.path();
-        auto relativePath = appBundleDirectory / fs::relative(absolute_path, appBundlePath);
+        for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
+            auto absolute_path = entry.path();
+            auto relativePath = appBundleDirectory / fs::relative(absolute_path, appBundlePath);
 
-        if (entry.is_directory()) {
-            if (!AddDirectoryEntryToZip(zip_file, relativePath, absolute_path)) {
-                zipClose(zip_file, NULL);
-                return false;
+            if (entry.is_directory()) {
+                if (!AddDirectoryEntryToZip(zip_file, relativePath, absolute_path)) {
+                    zipClose(zip_file, NULL);
+                    return false;
+                }
+            }
+            else {
+                if (!AddFileEntryToZip(zip_file, relativePath, absolute_path)) {
+                    zipClose(zip_file, NULL);
+                    return false;
+                }
             }
         }
-        else {
-            if (!AddFileEntryToZip(zip_file, relativePath, absolute_path)) {
-                zipClose(zip_file, NULL);
-                return false;
-            }
-        }
+
+        zipClose(zip_file, NULL);
+        return true;
+    }
+    catch (const std::exception &e) {
+        aylog_log("%s", e.what());        
     }
 
-    zipClose(zip_file, NULL);
-    return true;
+
+    return false;
 }
