@@ -27,6 +27,24 @@ const int kZipBufSize = 8192;
 const int kZipMaxPath = 512;
 
 
+static const uint32_t S_IRUSR = 0400;     // owner_read
+static const uint32_t S_IWUSR = 0200;     // owner_write
+static const uint32_t S_IXUSR = 0100;     // owner_exec
+static const uint32_t S_IRWXU = 0700;     // owner_all
+static const uint32_t S_IRGRP = 040;      // group_read
+static const uint32_t S_IWGRP = 020;      // group_write
+static const uint32_t S_IXGRP = 010;      // group_exec
+//static const uint32_t S_IRWXG = 070;      // group_all
+static const uint32_t S_IROTH = 04;       // others_read
+static const uint32_t S_IWOTH = 02;       // others_write
+static const uint32_t S_IXOTH = 01;       // others_exec
+//static const uint32_t S_IRWXO = 07;       // others_all
+//const uint32_t all = 0777;
+static const uint32_t S_ISUID = 04000;    // set_uid
+static const uint32_t S_ISGID = 02000;    // set_gid
+static const uint32_t S_ISVTX = 01000;    // sticky_bit
+
+
 static bool endsWith(const std::string &str, const std::string &suffix)
 {
     return str.size() >= suffix.size() && 0 == str.compare(str.size() - suffix.size(), suffix.size(), suffix);
@@ -51,6 +69,32 @@ static std::string replace_all(const std::string &str,
     }
     result.append(str, from, std::string::npos);
     return result;
+}
+
+static void permissionsToFile(const fs::path &absolute_path, uint32_t mode)
+{
+    fs::perms permissions = fs::perms::none;
+
+    if (mode & S_IRUSR)
+        permissions |= fs::perms::owner_read;
+    if (mode & S_IWUSR)
+        permissions |= fs::perms::owner_write;
+    if (mode & S_IXUSR)
+        permissions |= fs::perms::owner_exec;
+    if (mode & S_IRGRP)
+        permissions |= fs::perms::group_read;
+    if (mode & S_IWGRP)
+        permissions |= fs::perms::group_write;
+    if (mode & S_IXGRP)
+        permissions |= fs::perms::group_exec;
+    if (mode & S_IROTH)
+        permissions |= fs::perms::others_read;
+    if (mode & S_IWOTH)
+        permissions |= fs::perms::others_write;
+    if (mode & S_IXOTH)
+        permissions |= fs::perms::others_exec;
+
+    fs::permissions(absolute_path, permissions);
 }
 
 /********************************************
@@ -108,6 +152,7 @@ static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64
         }
     }
 
+    ofs.close();
     unzCloseCurrentFile(zip_file);
 
     return entire_file_extracted;
@@ -193,6 +238,9 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
                     unzClose(zip_file);
                     return false;
                 }
+
+                //permissionsToFile(absolute_path, (raw_file_info.external_fa >> 16) & 0x01FF);
+                //_wchmod(absolute_path.wstring().c_str(), (raw_file_info.external_fa >> 16) & 0x01FF);
             }
         } while (AdvanceToNextEntry(zip_file, zip_info.number_entry));
 
@@ -213,7 +261,41 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
  *              ZipAppBundle                *
  *                                          *
  ********************************************/
- // Returns a zip_fileinfo struct with the time represented by |file_time|.
+static uint32_t permissionsFromFile(const fs::path &absolute_path)
+{
+    fs::file_status status = fs::status(absolute_path);
+    fs::perms permissions = status.permissions();
+    uint32_t mode = 0;
+
+    if ((permissions & fs::perms::owner_read) != fs::perms::none)
+        mode |= S_IRUSR;
+    if ((permissions & fs::perms::owner_write) != fs::perms::none)
+        mode |= S_IWUSR;
+    if ((permissions & fs::perms::owner_exec) != fs::perms::none)
+        mode |= S_IXUSR;
+    if ((permissions & fs::perms::group_read) != fs::perms::none)
+        mode |= S_IRGRP;
+    if ((permissions & fs::perms::group_write) != fs::perms::none)
+        mode |= S_IWGRP;
+    if ((permissions & fs::perms::group_exec) != fs::perms::none)
+        mode |= S_IXGRP;
+    if ((permissions & fs::perms::others_read) != fs::perms::none)
+        mode |= S_IROTH;
+    if ((permissions & fs::perms::others_write) != fs::perms::none)
+        mode |= S_IWOTH;
+    if ((permissions & fs::perms::others_exec) != fs::perms::none)
+        mode |= S_IXOTH;
+
+    // fix mode
+    switch (status.type()) {
+        case fs::file_type::regular: mode = 0100000 | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH; break; // 0644
+        case fs::file_type::directory: mode = 0040000 | S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH; break; // 0755
+    }
+
+    return mode;
+}
+
+// Returns a zip_fileinfo struct with the time represented by |file_time|.
 static zip_fileinfo TimeToZipFileInfo(const fs::path &file_path)
 {
     zip_fileinfo zip_info = {};
@@ -264,6 +346,11 @@ static bool OpenNewFileEntry(zipFile zip_file, const fs::path &relative_path, co
     const uLong LANGUAGE_ENCODING_FLAG = 0x1 << 11;
 
     zip_fileinfo file_info = TimeToZipFileInfo(absolute_path);
+    //uint32_t mode = permissionsFromFile(absolute_path);
+    // IOS 13 laster need permissions
+    uint32_t mode = is_directory ? (0040000 | 0755) : (0100000 | 0644);
+    file_info.external_fa = (unsigned int)(mode << 16L);
+
     if (ZIP_OK != zipOpenNewFileInZip4(zip_file,                // file
                                        filename.c_str(),        // filename
                                        &file_info,              // zip_fileinfo
@@ -384,7 +471,7 @@ bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
         return true;
     }
     catch (const std::exception &e) {
-        aylog_log("%s", e.what());        
+        aylog_log("%s", e.what());
     }
 
 
