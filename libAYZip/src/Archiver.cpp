@@ -34,12 +34,12 @@ static const uint32_t S_IRWXU = 0700;     // owner_all
 static const uint32_t S_IRGRP = 040;      // group_read
 static const uint32_t S_IWGRP = 020;      // group_write
 static const uint32_t S_IXGRP = 010;      // group_exec
-//static const uint32_t S_IRWXG = 070;      // group_all
+static const uint32_t S_IRWXG = 070;      // group_all
 static const uint32_t S_IROTH = 04;       // others_read
 static const uint32_t S_IWOTH = 02;       // others_write
 static const uint32_t S_IXOTH = 01;       // others_exec
-//static const uint32_t S_IRWXO = 07;       // others_all
-//const uint32_t all = 0777;
+static const uint32_t S_IRWXO = 07;       // others_all
+//const uint32_t all = 0777;               // owner_all | group_all | others_all
 static const uint32_t S_ISUID = 04000;    // set_uid
 static const uint32_t S_ISGID = 02000;    // set_gid
 static const uint32_t S_ISVTX = 01000;    // sticky_bit
@@ -286,10 +286,15 @@ static uint32_t permissionsFromFile(const fs::path &absolute_path)
     if ((permissions & fs::perms::others_exec) != fs::perms::none)
         mode |= S_IXOTH;
 
+    if (permissions == fs::perms::all) {
+        mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    }
+
     // fix mode
     switch (status.type()) {
-        case fs::file_type::regular: mode = 0100000 | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH; break; // 0644
-        case fs::file_type::directory: mode = 0040000 | S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH; break; // 0755
+        case fs::file_type::regular: mode |= 0100000; break; // 0644
+        case fs::file_type::directory: mode |= 0040000 | S_IXUSR | S_IXGRP | S_IXOTH; break; // 0755
+        case fs::file_type::symlink: mode |= 0020000; break;
     }
 
     return mode;
