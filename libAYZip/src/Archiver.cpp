@@ -386,23 +386,27 @@ static bool CloseNewFileEntry(zipFile zip_file)
 
 static bool AddFileContentToZip(zipFile zip_file, const fs::path &file_path)
 {
-    int num_bytes;
-    char buf[kZipBufSize];
+    size_t sizeRead;
+    std::vector<char> buff;
+    buff.resize(kZipBufSize);
 
-    std::ifstream ifs(file_path.string(), std::ifstream::binary);
+    int err = ZIP_OK;
+
+    std::ifstream input(file_path.string(), std::ifstream::binary);
     do {
-        ifs.read(buf, kZipBufSize);
-        num_bytes = static_cast<int>(ifs.gcount());
+        input.read(buff.data(), buff.size());
+        sizeRead = static_cast<size_t>(input.gcount());
 
-        if (num_bytes > 0) {
-            if (zipWriteInFileInZip(zip_file, buf, num_bytes) != ZIP_OK) {
-                aylog_log("Add file to zip: %s", file_path.c_str());
-                return false;
-            }
+        if (sizeRead < buff.size() && !input.eof() && !input.good()) {
+            err = ZIP_ERRNO;
         }
-    } while (ifs);
+        else if (sizeRead > 0) {
+            err = zipWriteInFileInZip(zip_file, buff.data(), static_cast<unsigned int>(sizeRead));
+        }
+    } while (err == ZIP_OK && sizeRead > 0);
 
-    return true;
+    input.close();
+    return err == ZIP_OK;
 }
 
 static bool AddFileEntryToZip(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path)
