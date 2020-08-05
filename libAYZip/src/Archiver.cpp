@@ -122,7 +122,7 @@ static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64
     std::unique_ptr<char[]> buf(new char[kZipBufSize]);
 
     uint64_t remaining_capacity = num_bytes_to_extract;
-    bool entire_file_extracted = false;
+    bool entire_file_extracted = num_bytes_to_extract ? false : true;
 
     while (remaining_capacity > 0) {
         const int num_bytes_read = unzReadCurrentFile(zip_file, buf.get(), kZipBufSize);
