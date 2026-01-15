@@ -1,4 +1,4 @@
-//
+﻿//
 //  Archiver.cpp
 //  AltSign-Windows
 //
@@ -7,24 +7,25 @@
 //
 
 #include "Archiver.hpp"
-#include <AYLog.h>
 #include <chrono>
-#include <iomanip>
 #include <filesystem>
 #include <fstream>
-
-#include <sstream>
-#include <WinSock2.h>
+#include <spdlog/AYLog.h>
 
 namespace fs = std::filesystem;
 
 extern "C" {
-#include "minizip/zip.h"
-#include "minizip/unzip.h"
+#include <minizip-ng/mz.h>
+#include <minizip-ng/mz_strm.h>
+#include <minizip-ng/mz_zip.h>
+#include <minizip-ng/mz_zip_rw.h>
 }
 
-const int kZipBufSize = 8192;
-const int kZipMaxPath = 512;
+// 大文件优化：64KB 缓冲区，减少系统调用次数
+// 8KB  处理 2GB 需要 ~262,000 次读写
+// 64KB 处理 2GB 需要 ~32,768 次读写 (8x 减少)
+constexpr size_t kZipBufSize = 64 * 1024;  // 64KB
+constexpr int kZipMaxPath = 512;
 
 
 static const uint32_t S_IRUSR = 0400;     // owner_read
@@ -59,6 +60,10 @@ static std::string replace_all(const std::string &str,
                                const std::string &find,
                                const std::string &replace)
 {
+    if (find.empty()) {
+        return str;
+    }
+    
     std::string result;
     size_t find_len = find.size();
     size_t pos, from = 0;
@@ -68,6 +73,44 @@ static std::string replace_all(const std::string &str,
         from = pos + find_len;
     }
     result.append(str, from, std::string::npos);
+    return result;
+}
+
+// Windows 非法字符 -> 占位符 映射表
+// macOS/iOS 允许但 Windows 不允许: < > : " | ? *
+struct CharMapping {
+    const char* original;      // macOS/iOS 中的字符
+    const char* placeholder;   // Windows 上的占位符
+};
+
+static const CharMapping kPathCharMappings[] = {
+    {":",  "__colon__"},
+    {"<",  "__lt__"},
+    {">",  "__gt__"},
+    {"\"", "__quote__"},
+    {"|",  "__pipe__"},
+    {"?",  "__qmark__"},
+    {"*",  "__star__"},
+    // 可在此添加更多映射
+};
+
+// 将 macOS/iOS 路径转换为 Windows 安全路径（解压时使用）
+static std::string ToWindowsSafePath(const std::string &path)
+{
+    std::string result = path;
+    for (const auto &mapping : kPathCharMappings) {
+        result = replace_all(result, mapping.original, mapping.placeholder);
+    }
+    return result;
+}
+
+// 将 Windows 占位符还原为 macOS/iOS 字符（压缩时使用）
+static std::string FromWindowsSafePath(const std::string &path)
+{
+    std::string result = path;
+    for (const auto &mapping : kPathCharMappings) {
+        result = replace_all(result, mapping.placeholder, mapping.original);
+    }
     return result;
 }
 
@@ -102,9 +145,9 @@ static void permissionsToFile(const fs::path &absolute_path, uint32_t mode)
  *            UnzipAppBundle                *
  *                                          *
  ********************************************/
-static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64_t num_bytes_to_extract)
+static bool ExtractFileEntry(void *zip_reader, const fs::path &file_path, uint64_t num_bytes_to_extract)
 {
-    if (unzOpenCurrentFile(zip_file) != UNZ_OK) {
+    if (mz_zip_reader_entry_open(zip_reader) != MZ_OK) {
         return false;
     }
 
@@ -113,143 +156,152 @@ static bool ExtractFileEntry(zipFile zip_file, const fs::path &file_path, uint64
         fs::create_directories(parentDirectory);
     }
 
-    std::ofstream ofs(file_path.string(), std::ifstream::binary);
-    if (ofs.bad()) {
-        unzCloseCurrentFile(zip_file);
+    std::ofstream ofs(file_path.string(), std::ios::binary);
+    if (!ofs) {
+        mz_zip_reader_entry_close(zip_reader);
         return false;
     }
 
     std::unique_ptr<char[]> buf(new char[kZipBufSize]);
+    uint64_t total_written = 0;
+    bool success = true;
 
-    uint64_t remaining_capacity = num_bytes_to_extract;
-    bool entire_file_extracted = num_bytes_to_extract ? false : true;
+    while (total_written < num_bytes_to_extract) {
+        const int32_t num_bytes_read = mz_zip_reader_entry_read(zip_reader, buf.get(), kZipBufSize);
 
-    while (remaining_capacity > 0) {
-        const int num_bytes_read = unzReadCurrentFile(zip_file, buf.get(), kZipBufSize);
-
+        if (num_bytes_read < 0) {
+            // Read error
+            success = false;
+            break;
+        }
         if (num_bytes_read == 0) {
-            entire_file_extracted = true;
+            // EOF before expected size - file is smaller than expected
+            success = (total_written == num_bytes_to_extract);
             break;
         }
-        else if (num_bytes_read < 0) {
-            // If num_bytes_read < 0, then it's a specific UNZ_* error code.
+
+        uint64_t remaining = num_bytes_to_extract - total_written;
+        uint64_t to_write = std::min<uint64_t>(remaining, static_cast<uint64_t>(num_bytes_read));
+
+        ofs.write(buf.get(), to_write);
+        if (!ofs) {
+            success = false;
             break;
         }
-        else if (num_bytes_read > 0) {
-            uint64_t num_bytes_to_write = std::min<uint64_t>(remaining_capacity, static_cast<uint64_t>(num_bytes_read));
 
-            ofs.write(buf.get(), num_bytes_to_write);
-            if (ofs.bad()) {
-                break;
-            }
+        total_written += to_write;
 
-            if (remaining_capacity == static_cast<uint64_t>(num_bytes_read)) {
-                // Ensures function returns true if the entire file has been read.
-                entire_file_extracted = (unzReadCurrentFile(zip_file, buf.get(), 1) == 0);
-            }
+        // If we read more than needed, file is larger than expected
+        if (static_cast<uint64_t>(num_bytes_read) > remaining) {
+            success = false;
+            break;
+        }
+    }
 
-            remaining_capacity -= num_bytes_to_write;
+    // Verify we've reached EOF (file size matches expected)
+    if (success && total_written == num_bytes_to_extract) {
+        char extra;
+        if (mz_zip_reader_entry_read(zip_reader, &extra, 1) != 0) {
+            // File has more data than expected
+            success = false;
         }
     }
 
     ofs.close();
-    unzCloseCurrentFile(zip_file);
+    mz_zip_reader_entry_close(zip_reader);
 
-    return entire_file_extracted;
-}
-
-static bool AdvanceToNextEntry(zipFile zip_file, uLong num_entries)
-{
-    unz_file_pos position = {};
-    if (unzGetFilePos(zip_file, &position) != UNZ_OK)
-        return false;
-
-    const uLong current_entry_index = position.num_of_file;
-    // If we are currently at the last entry, then the next position is the
-    // end of the zip file, so mark that we reached the end.
-    if (current_entry_index + 1 == num_entries) {
-        return false;
-    }
-    else {
-        if (unzGoToNextFile(zip_file) != UNZ_OK) {
-            return false;
-        }
-    }
-
-    return true;
+    return success;
 }
 
 bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDirectory)
 {
     fs::path appBundlePath = outputDirectory;
-    fs::path ipaPath = archivePath;
 
     if (!fs::exists(appBundlePath)) {
         return false;
     }
 
+    void *zip_reader = nullptr;
     try {
-        unzFile zip_file = unzOpen(archivePath.c_str());
-        if (zip_file == NULL) {
-            aylog_log("unzOpen faild: %s", archivePath.c_str());
+        zip_reader = mz_zip_reader_create();
+        if (zip_reader == NULL) {
+            AYError("mz_zip_reader_create failed");
             return false;
         }
 
-        unz_global_info zip_info = {};
-        if (unzGetGlobalInfo(zip_file, &zip_info) != UNZ_OK) {
-            unzClose(zip_file);
+        int32_t err = mz_zip_reader_open_file(zip_reader, archivePath.c_str());
+        if (err != MZ_OK) {
+            AYError("mz_zip_reader_open_file failed: {}", archivePath);
+            mz_zip_reader_delete(&zip_reader);
+            return false;
+        }
+
+        err = mz_zip_reader_goto_first_entry(zip_reader);
+        if (err == MZ_END_OF_LIST) {
+            // Empty zip file
+            mz_zip_reader_close(zip_reader);
+            mz_zip_reader_delete(&zip_reader);
+            return true;
+        }
+        if (err != MZ_OK) {
+            mz_zip_reader_close(zip_reader);
+            mz_zip_reader_delete(&zip_reader);
             return false;
         }
 
         auto toWin32Path = [](std::string filename) -> std::string {
             std::replace(filename.begin(), filename.end(), '/', '\\');
-            std::string outname = replace_all(filename, ":", "__colon__");
+            std::string outname = ToWindowsSafePath(filename);
             return fs::relative(outname, "Payload\\").string();
         };
 
-
-        do {
-            unz_file_info raw_file_info = {};
-            char raw_file_name_in_zip[kZipMaxPath] = {};
-
-            if (unzGetCurrentFileInfo(zip_file, &raw_file_info, raw_file_name_in_zip, kZipMaxPath, NULL, 0, NULL, 0) != UNZ_OK) {
+        while (err == MZ_OK) {
+            mz_zip_file *file_info = NULL;
+            err = mz_zip_reader_entry_get_info(zip_reader, &file_info);
+            if (err != MZ_OK) {
                 break;
             }
 
             std::string filename;
-            if (raw_file_info.flag & 0x808) { // 0x800 | 0x8
-                filename = fs::u8path(raw_file_name_in_zip).string();
+            if (file_info->flag & MZ_ZIP_FLAG_UTF8) {
+                filename = fs::u8path(file_info->filename).string();
             }
             else {
-                filename = fs::path(raw_file_name_in_zip).string();
+                filename = fs::path(file_info->filename).string();
             }
 
-            if (startsWith(filename, "__MACOSX")) {
-                continue;
-            }
-
-            fs::path absolute_path = appBundlePath / toWin32Path(filename);
-            if (endsWith(filename, "/")) { // directory
-                fs::create_directories(absolute_path); // must create_directories inculde parent path 
-            }
-            else { // file
-                if (!ExtractFileEntry(zip_file, absolute_path, raw_file_info.uncompressed_size)) {
-                    aylog_log("Extracted file faild: %s", filename.c_str());
-                    unzClose(zip_file);
-                    return false;
+            if (!startsWith(filename, "__MACOSX")) {
+                fs::path absolute_path = appBundlePath / toWin32Path(filename);
+                if (endsWith(filename, "/")) { // directory
+                    fs::create_directories(absolute_path); // must create_directories inculde parent path 
                 }
+                else { // file
+                    if (!ExtractFileEntry(zip_reader, absolute_path, file_info->uncompressed_size)) {
+                        AYError("Extracted file failed: {}", filename);
+                        mz_zip_reader_close(zip_reader);
+                        mz_zip_reader_delete(&zip_reader);
+                        return false;
+                    }
 
-                //permissionsToFile(absolute_path, (raw_file_info.external_fa >> 16) & 0x01FF);
-                //_wchmod(absolute_path.wstring().c_str(), (raw_file_info.external_fa >> 16) & 0x01FF);
+                    //permissionsToFile(absolute_path, (file_info->external_fa >> 16) & 0x01FF);
+                    //_wchmod(absolute_path.wstring().c_str(), (file_info->external_fa >> 16) & 0x01FF);
+                }
             }
-        } while (AdvanceToNextEntry(zip_file, zip_info.number_entry));
 
-        unzClose(zip_file);
+            err = mz_zip_reader_goto_next_entry(zip_reader);
+        }
+
+        mz_zip_reader_close(zip_reader);
+        mz_zip_reader_delete(&zip_reader);
 
         return true;
     }
     catch (const std::exception &e) {
-        aylog_log("%s", e.what());
+        AYError("{}", e.what());
+        if (zip_reader) {
+            mz_zip_reader_close(zip_reader);
+            mz_zip_reader_delete(&zip_reader);
+        }
     }
 
     return false;
@@ -300,16 +352,28 @@ static uint32_t permissionsFromFile(const fs::path &absolute_path)
     return mode;
 }
 
-// Returns a zip_fileinfo struct with the time represented by |file_time|.
-static zip_fileinfo TimeToZipFileInfo(const fs::path &file_path)
+static std::string ToZipPath(const fs::path &relative_path, bool is_directory)
 {
-    zip_fileinfo zip_info = {};
-    tm lt = {};
-    std::time_t t = 0;
+    std::string str_path = relative_path.u8string();
+    std::replace(str_path.begin(), str_path.end(), '\\', '/');
+    str_path = FromWindowsSafePath(str_path);  // 还原为 macOS/iOS 原始字符
+    if (is_directory && !str_path.empty() && str_path.back() != '/')
+        str_path += "/";
+    return str_path;
+}
 
-    if (fs::exists(file_path)) {
+static bool OpenNewFileEntry(void *zip_writer, const std::string &filename_in_zip, const fs::path &absolute_path, bool is_directory)
+{
+    mz_zip_file file_info = {};
+    file_info.filename = filename_in_zip.c_str();
+    file_info.flag = MZ_ZIP_FLAG_UTF8;
+    file_info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+
+    // Get file time
+    std::time_t t = 0;
+    if (fs::exists(absolute_path)) {
         using namespace std::chrono_literals;
-        auto ftime = fs::last_write_time(file_path);
+        auto ftime = fs::last_write_time(absolute_path);
         auto tmp = fs::file_time_type::clock::now().time_since_epoch() - ftime.time_since_epoch();
         auto sys = std::chrono::system_clock::now() - tmp;
         t = std::chrono::system_clock::to_time_t(sys);
@@ -318,115 +382,80 @@ static zip_fileinfo TimeToZipFileInfo(const fs::path &file_path)
         auto sys = std::chrono::system_clock::now();
         t = std::chrono::system_clock::to_time_t(sys);
     }
+    file_info.modified_date = t;
+    file_info.accessed_date = t;
+    file_info.creation_date = t;
 
-    localtime_s(&lt, &t);
-    //time_t CurTime = time(NULL);
-    //tm *mytime = localtime(&CurTime);
-    zip_info.tmz_date.tm_sec = lt.tm_sec;
-    zip_info.tmz_date.tm_min = lt.tm_min;
-    zip_info.tmz_date.tm_hour = lt.tm_hour;
-    zip_info.tmz_date.tm_mday = lt.tm_mday;
-    zip_info.tmz_date.tm_mon = lt.tm_mon;
-    zip_info.tmz_date.tm_year = lt.tm_year;
+    // IOS 13 later need permissions
+    uint32_t mode = is_directory ? (0040000 | 0755) : (0100000 | 0644);
+    file_info.external_fa = (uint32_t)(mode << 16L);
 
-    return zip_info;
+    int32_t err = mz_zip_writer_entry_open(zip_writer, &file_info);
+    return err == MZ_OK;
 }
 
-static bool OpenNewFileEntry(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path, bool is_directory)
+static bool CloseNewFileEntry(void *zip_writer)
 {
-    std::string str_path = relative_path.u8string();
+    return mz_zip_writer_entry_close(zip_writer) == MZ_OK;
+}
 
-    auto toZipPath = [](std::string filename) -> std::string {
-        std::replace(filename.begin(), filename.end(), '\\', '/');
-        return replace_all(filename, "__colon__", ":");
-    };
-
-    std::string filename = toZipPath(str_path);
-
-    if (is_directory)
-        filename += "/";
-
-    // Section 4.4.4 http://www.pkware.com/documents/casestudies/APPNOTE.TXT
-    // Setting the Language encoding flag so the file is told to be in utf-8.
-    const uLong LANGUAGE_ENCODING_FLAG = 0x1 << 11;
-
-    zip_fileinfo file_info = TimeToZipFileInfo(absolute_path);
-    //uint32_t mode = permissionsFromFile(absolute_path);
-    // IOS 13 laster need permissions
-    uint32_t mode = is_directory ? (0040000 | 0755) : (0100000 | 0644);
-    file_info.external_fa = (unsigned int)(mode << 16L);
-
-    if (ZIP_OK != zipOpenNewFileInZip4(zip_file,                // file
-                                       filename.c_str(),        // filename
-                                       &file_info,              // zip_fileinfo
-                                       NULL,                    // extrafield_local,
-                                       0u,                      // size_extrafield_local
-                                       NULL,                    // extrafield_global
-                                       0u,                      // size_extrafield_global
-                                       NULL,                    // comment
-                                       Z_DEFLATED,              // method
-                                       Z_DEFAULT_COMPRESSION,   // level
-                                       0,                       // raw
-                                       -MAX_WBITS,              // windowBits
-                                       DEF_MEM_LEVEL,           // memLevel
-                                       Z_DEFAULT_STRATEGY,      // strategy
-                                       NULL,                    // password
-                                       0,                       // crcForCrypting
-                                       0,                       // versionMadeBy
-                                       LANGUAGE_ENCODING_FLAG)) {  // flagBase
+static bool AddFileContentToZip(void *zip_writer, const fs::path &file_path)
+{
+    std::ifstream input(file_path.string(), std::ios::binary);
+    if (!input) {
         return false;
     }
-    return true;
-}
 
-static bool CloseNewFileEntry(zipFile zip_file)
-{
-    return zipCloseFileInZip(zip_file) == ZIP_OK;
-}
-
-static bool AddFileContentToZip(zipFile zip_file, const fs::path &file_path)
-{
+    std::vector<char> buff(kZipBufSize);
     size_t sizeRead;
-    std::vector<char> buff;
-    buff.resize(kZipBufSize);
+    bool success = true;
 
-    int err = ZIP_OK;
-
-    std::ifstream input(file_path.string(), std::ifstream::binary);
     do {
         input.read(buff.data(), buff.size());
         sizeRead = static_cast<size_t>(input.gcount());
 
-        if (sizeRead < buff.size() && !input.eof() && !input.good()) {
-            err = ZIP_ERRNO;
+        if (input.bad()) {
+            success = false;
+            break;
         }
-        else if (sizeRead > 0) {
-            err = zipWriteInFileInZip(zip_file, buff.data(), static_cast<unsigned int>(sizeRead));
+
+        if (sizeRead > 0) {
+            // mz_zip_writer_entry_write returns bytes written (>0) on success, or negative error code
+            int32_t written = mz_zip_writer_entry_write(zip_writer, buff.data(), static_cast<int32_t>(sizeRead));
+            if (written < 0 || static_cast<size_t>(written) != sizeRead) {
+                success = false;
+                break;
+            }
         }
-    } while (err == ZIP_OK && sizeRead > 0);
+    } while (sizeRead > 0 && !input.eof());
 
     input.close();
-    return err == ZIP_OK;
+    return success;
 }
 
-static bool AddFileEntryToZip(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path)
+static bool AddFileEntryToZip(void *zip_writer, const fs::path &relative_path, const fs::path &absolute_path)
 {
     if (!fs::exists(absolute_path))
         return false;
 
-    if (!OpenNewFileEntry(zip_file, relative_path, absolute_path, false))
+    // Keep filename alive until entry is closed
+    std::string filename_in_zip = ToZipPath(relative_path, false);
+    
+    if (!OpenNewFileEntry(zip_writer, filename_in_zip, absolute_path, false))
         return false;
 
-    bool success = AddFileContentToZip(zip_file, absolute_path);
-    if (!CloseNewFileEntry(zip_file))
+    bool success = AddFileContentToZip(zip_writer, absolute_path);
+    if (!CloseNewFileEntry(zip_writer))
         return false;
 
     return success;
 }
 
-static bool AddDirectoryEntryToZip(zipFile zip_file, const fs::path &relative_path, const fs::path &absolute_path)
+static bool AddDirectoryEntryToZip(void *zip_writer, const fs::path &relative_path, const fs::path &absolute_path)
 {
-    return OpenNewFileEntry(zip_file, relative_path, absolute_path, true) && CloseNewFileEntry(zip_file);
+    // Keep filename alive until entry is closed
+    std::string filename_in_zip = ToZipPath(relative_path, true);
+    return OpenNewFileEntry(zip_writer, filename_in_zip, absolute_path, true) && CloseNewFileEntry(zip_writer);
 }
 
 bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
@@ -437,52 +466,66 @@ bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
     auto appBundleFilename = appBundlePath.filename();
 
     if (archivePath.empty()) {
-        auto appName = appBundlePath.filename().stem().string();
+        auto appName = appBundleFilename.stem().string();
         auto ipaName = appName + ".ipa";
-        ipaPath = appBundlePath.remove_filename().append(ipaName);
+        ipaPath = appBundlePath.parent_path() / ipaName;
     }
 
+    void *zip_writer = nullptr;
     try {
         if (fs::exists(ipaPath)) {
             fs::remove(ipaPath);
         }
 
-        zipFile zip_file = zipOpen((const char *)ipaPath.string().c_str(), APPEND_STATUS_CREATE);
-        if (zip_file == nullptr) {
-            aylog_log("zipOpen faild: %s", archivePath.c_str());
+        zip_writer = mz_zip_writer_create();
+        if (zip_writer == nullptr) {
+            AYError("mz_zip_writer_create failed");
+            return false;
+        }
+
+        int32_t err = mz_zip_writer_open_file(zip_writer, ipaPath.string().c_str(), 0, 0);
+        if (err != MZ_OK) {
+            AYError("mz_zip_writer_open_file failed: {}", archivePath);
+            mz_zip_writer_delete(&zip_writer);
             return false;
         }
 
         fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
 
         // must add
-        //AddDirectoryEntryToZip(zip_file, "Payload", "");
+        //AddDirectoryEntryToZip(zip_writer, "Payload", "");
 
         for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
             auto absolute_path = entry.path();
             auto relativePath = appBundleDirectory / fs::relative(absolute_path, appBundlePath);
 
             if (entry.is_directory()) {
-                if (!AddDirectoryEntryToZip(zip_file, relativePath, absolute_path)) {
-                    zipClose(zip_file, NULL);
+                if (!AddDirectoryEntryToZip(zip_writer, relativePath, absolute_path)) {
+                    mz_zip_writer_close(zip_writer);
+                    mz_zip_writer_delete(&zip_writer);
                     return false;
                 }
             }
             else {
-                if (!AddFileEntryToZip(zip_file, relativePath, absolute_path)) {
-                    zipClose(zip_file, NULL);
+                if (!AddFileEntryToZip(zip_writer, relativePath, absolute_path)) {
+                    mz_zip_writer_close(zip_writer);
+                    mz_zip_writer_delete(&zip_writer);
                     return false;
                 }
             }
         }
 
-        zipClose(zip_file, NULL);
+        mz_zip_writer_close(zip_writer);
+        mz_zip_writer_delete(&zip_writer);
         return true;
     }
     catch (const std::exception &e) {
-        aylog_log("%s", e.what());
+        AYError("{}", e.what());
+        if (zip_writer) {
+            mz_zip_writer_close(zip_writer);
+            mz_zip_writer_delete(&zip_writer);
+        }
     }
-
 
     return false;
 }

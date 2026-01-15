@@ -16,9 +16,6 @@
     <Filter Include="src">
       <UniqueIdentifier>{0b21c2c7-cab7-4ebd-9c0e-e0b3a10fabd3}</UniqueIdentifier>
     </Filter>
-    <Filter Include="src\minizip">
-      <UniqueIdentifier>{5a5b5def-256e-45a2-8b0e-57ae7500843f}</UniqueIdentifier>
-    </Filter>
     <Filter Include="dll">
       <UniqueIdentifier>{b23d3b74-0720-4f0d-88ea-444bec0d15df}</UniqueIdentifier>
     </Filter>
@@ -36,18 +33,6 @@
     <ClInclude Include="pch.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="src\minizip\crypt.h">
-      <Filter>src\minizip</Filter>
-    </ClInclude>
-    <ClInclude Include="src\minizip\ioapi.h">
-      <Filter>src\minizip</Filter>
-    </ClInclude>
-    <ClInclude Include="src\minizip\unzip.h">
-      <Filter>src\minizip</Filter>
-    </ClInclude>
-    <ClInclude Include="src\minizip\zip.h">
-      <Filter>src\minizip</Filter>
-    </ClInclude>
     <ClInclude Include="src\Archiver.hpp">
       <Filter>src</Filter>
     </ClInclude>
@@ -57,7 +42,10 @@
     <ClInclude Include="resource.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\AYBase\AYLog.h">
+    <ClInclude Include="..\..\AYBase\spdlog\AYLog.h">
+      <Filter>Utilities</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\AYBase\spdlog\AYLogSettings.h">
       <Filter>Utilities</Filter>
     </ClInclude>
   </ItemGroup>
@@ -68,22 +56,16 @@
     <ClCompile Include="pch.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="src\minizip\ioapi.c">
-      <Filter>src\minizip</Filter>
-    </ClCompile>
-    <ClCompile Include="src\minizip\unzip.c">
-      <Filter>src\minizip</Filter>
-    </ClCompile>
-    <ClCompile Include="src\minizip\zip.c">
-      <Filter>src\minizip</Filter>
-    </ClCompile>
     <ClCompile Include="src\Archiver.cpp">
       <Filter>src</Filter>
     </ClCompile>
     <ClCompile Include="libAYZip.cpp">
       <Filter>dll</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\AYBase\AYLog.cpp">
+    <ClCompile Include="..\..\AYBase\spdlog\AYLog.cpp">
+      <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\AYBase\spdlog\AYLogSettings.cpp">
       <Filter>Utilities</Filter>
     </ClCompile>
   </ItemGroup>

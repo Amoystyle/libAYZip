@@ -12,6 +12,8 @@
 #define LIBAYZIP_API DLL_EXTERN __declspec(dllimport)
 #endif
 
+typedef void (*AYZipLogCallback)(const char* level, const char* message);
+LIBAYZIP_API void AYZipInitLog(const char* loggerName, AYZipLogCallback callback);
 
 LIBAYZIP_API bool AYUnzipApp(const char *archivePath, const char *appPath);
 LIBAYZIP_API bool AYZipApp(const char *appPath, const char *archivePath);
