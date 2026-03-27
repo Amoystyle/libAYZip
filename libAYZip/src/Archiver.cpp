@@ -7,10 +7,13 @@
 //
 
 #include "Archiver.hpp"
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <spdlog/AYLog.h>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -114,6 +117,64 @@ static std::string FromWindowsSafePath(const std::string &path)
     return result;
 }
 
+static bool IsSubPath(const fs::path &rootPath, const fs::path &candidatePath)
+{
+    const fs::path normalizedRoot = fs::absolute(rootPath).lexically_normal();
+    const fs::path normalizedCandidate = fs::absolute(candidatePath).lexically_normal();
+
+    auto rootIt = normalizedRoot.begin();
+    auto candidateIt = normalizedCandidate.begin();
+    for (; rootIt != normalizedRoot.end(); ++rootIt, ++candidateIt) {
+        if (candidateIt == normalizedCandidate.end() || *rootIt != *candidateIt) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool TryResolveEntryPath(const std::string &entryFilename, const fs::path &outputDirectory, fs::path &resolvedPath, bool &isDirectory)
+{
+    if (entryFilename.empty()) {
+        return false;
+    }
+
+    std::string normalizedFilename = entryFilename;
+    std::replace(normalizedFilename.begin(), normalizedFilename.end(), '\\', '/');
+    isDirectory = endsWith(normalizedFilename, "/");
+
+    fs::path zipPath = fs::u8path(normalizedFilename).lexically_normal();
+    if (zipPath.empty() || zipPath.is_absolute()) {
+        return false;
+    }
+
+    auto part = zipPath.begin();
+    if (part == zipPath.end() || *part != "Payload") {
+        return false;
+    }
+    ++part;
+
+    fs::path relativePath;
+    for (; part != zipPath.end(); ++part) {
+        if (*part == "." || *part == "..") {
+            return false;
+        }
+
+        const std::string safePart = ToWindowsSafePath(part->u8string());
+        if (safePart.empty() || safePart == "." || safePart == "..") {
+            return false;
+        }
+        relativePath /= fs::u8path(safePart);
+    }
+
+    if (relativePath.empty() && !isDirectory) {
+        return false;
+    }
+
+    resolvedPath = fs::absolute(outputDirectory / relativePath).lexically_normal();
+    return IsSubPath(outputDirectory, resolvedPath);
+}
+
 static void permissionsToFile(const fs::path &absolute_path, uint32_t mode)
 {
     fs::perms permissions = fs::perms::none;
@@ -156,7 +217,7 @@ static bool ExtractFileEntry(void *zip_reader, const fs::path &file_path, uint64
         fs::create_directories(parentDirectory);
     }
 
-    std::ofstream ofs(file_path.string(), std::ios::binary);
+    std::ofstream ofs(file_path, std::ios::binary);
     if (!ofs) {
         mz_zip_reader_entry_close(zip_reader);
         return false;
@@ -249,16 +310,12 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
             return false;
         }
 
-        auto toWin32Path = [](std::string filename) -> std::string {
-            std::replace(filename.begin(), filename.end(), '/', '\\');
-            std::string outname = ToWindowsSafePath(filename);
-            return fs::relative(outname, "Payload\\").string();
-        };
-
+        bool success = true;
         while (err == MZ_OK) {
             mz_zip_file *file_info = NULL;
             err = mz_zip_reader_entry_get_info(zip_reader, &file_info);
-            if (err != MZ_OK) {
+            if (err != MZ_OK || file_info == nullptr) {
+                success = false;
                 break;
             }
 
@@ -271,16 +328,22 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
             }
 
             if (!startsWith(filename, "__MACOSX")) {
-                fs::path absolute_path = appBundlePath / toWin32Path(filename);
-                if (endsWith(filename, "/")) { // directory
+                fs::path absolute_path;
+                bool isDirectory = false;
+                if (!TryResolveEntryPath(filename, appBundlePath, absolute_path, isDirectory)) {
+                    AYError("Unsafe zip entry path rejected: {}", filename);
+                    success = false;
+                    break;
+                }
+
+                if (isDirectory) { // directory
                     fs::create_directories(absolute_path); // must create_directories inculde parent path 
                 }
                 else { // file
                     if (!ExtractFileEntry(zip_reader, absolute_path, file_info->uncompressed_size)) {
                         AYError("Extracted file failed: {}", filename);
-                        mz_zip_reader_close(zip_reader);
-                        mz_zip_reader_delete(&zip_reader);
-                        return false;
+                        success = false;
+                        break;
                     }
 
                     //permissionsToFile(absolute_path, (file_info->external_fa >> 16) & 0x01FF);
@@ -291,10 +354,14 @@ bool UnzipAppBundle(const std::string &archivePath, const std::string &outputDir
             err = mz_zip_reader_goto_next_entry(zip_reader);
         }
 
+        if (err != MZ_END_OF_LIST) {
+            success = false;
+        }
+
         mz_zip_reader_close(zip_reader);
         mz_zip_reader_delete(&zip_reader);
 
-        return true;
+        return success;
     }
     catch (const std::exception &e) {
         AYError("{}", e.what());
@@ -367,7 +434,7 @@ static bool OpenNewFileEntry(void *zip_writer, const std::string &filename_in_zi
     mz_zip_file file_info = {};
     file_info.filename = filename_in_zip.c_str();
     file_info.flag = MZ_ZIP_FLAG_UTF8;
-    file_info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+    file_info.compression_method = is_directory ? MZ_COMPRESS_METHOD_STORE : MZ_COMPRESS_METHOD_DEFLATE;
 
     // Get file time
     std::time_t t = 0;
@@ -401,7 +468,7 @@ static bool CloseNewFileEntry(void *zip_writer)
 
 static bool AddFileContentToZip(void *zip_writer, const fs::path &file_path)
 {
-    std::ifstream input(file_path.string(), std::ios::binary);
+    std::ifstream input(file_path, std::ios::binary);
     if (!input) {
         return false;
     }
@@ -490,10 +557,24 @@ bool ZipAppBundle(const std::string &appPath, const std::string &archivePath)
             return false;
         }
 
-        fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
+        void *zip_handle = nullptr;
+        err = mz_zip_writer_get_zip_handle(zip_writer, &zip_handle);
+        if (err != MZ_OK || zip_handle == nullptr) {
+            AYError("mz_zip_writer_get_zip_handle failed");
+            mz_zip_writer_close(zip_writer);
+            mz_zip_writer_delete(&zip_writer);
+            return false;
+        }
 
-        // must add
-        //AddDirectoryEntryToZip(zip_writer, "Payload", "");
+        err = mz_zip_set_data_descriptor(zip_handle, 0);
+        if (err != MZ_OK) {
+            AYError("mz_zip_set_data_descriptor failed");
+            mz_zip_writer_close(zip_writer);
+            mz_zip_writer_delete(&zip_writer);
+            return false;
+        }
+
+        fs::path appBundleDirectory = fs::path("Payload") / appBundleFilename;
 
         for (auto &entry : fs::recursive_directory_iterator(appBundlePath)) {
             auto absolute_path = entry.path();
